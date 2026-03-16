@@ -13,24 +13,19 @@ static inline H264FrameDecoder* toDecoder(jlong handle) {
     return reinterpret_cast<H264FrameDecoder*>(handle);
 }
 
-extern "C" {
+// ── Native 方法实现（去掉 Java_ 前缀命名约定，改为普通 static 函数）────────────
 
-// 创建 Native 解码器实例，返回句柄
-JNIEXPORT jlong JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeCreate(JNIEnv* /*env*/, jobject /*thiz*/) {
-    auto* decoder = new H264FrameDecoder();
+static jlong nativeCreate(JNIEnv * /*env*/, jobject /*thiz*/) {
+    auto *decoder = new H264FrameDecoder();
     return reinterpret_cast<jlong>(decoder);
 }
 
-// 绑定 Surface（ANativeWindow）
-JNIEXPORT void JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeSetSurface(JNIEnv* env, jobject /*thiz*/,
-                                                               jlong handle, jobject surface) {
+static void nativeSetSurface(JNIEnv *env, jobject /*thiz*/, jlong handle, jobject surface) {
     if (handle == 0) {
         LOGE("nativeSetSurface: invalid handle");
         return;
     }
-    ANativeWindow* window = nullptr;
+    ANativeWindow *window = nullptr;
     if (surface != nullptr) {
         window = ANativeWindow_fromSurface(env, surface);
     }
@@ -41,47 +36,34 @@ Java_com_mediakit_h264decoder_H264JniDecoder_nativeSetSurface(JNIEnv* env, jobje
     }
 }
 
-// 初始化解码器
-JNIEXPORT jint JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeInit(JNIEnv* /*env*/, jobject /*thiz*/,
-                                                         jlong handle, jint width, jint height) {
+static jint nativeInit(JNIEnv * /*env*/, jobject /*thiz*/, jlong handle, jint width, jint height) {
     if (handle == 0) {
         LOGE("nativeInit: invalid handle");
         return static_cast<jint>(DecodeError::NOT_INITIALIZED);
     }
-    DecodeError err = toDecoder(handle)->init(width, height);
-    return static_cast<jint>(err);
+    return static_cast<jint>(toDecoder(handle)->init(width, height));
 }
 
-// 解码单帧
-JNIEXPORT jint JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeDecodeFrame(JNIEnv* env, jobject /*thiz*/,
-                                                                jlong handle,
-                                                                jbyteArray data, jint length) {
+static jint nativeDecodeFrame(JNIEnv *env, jobject /*thiz*/,
+                              jlong handle, jbyteArray data, jint length) {
     if (handle == 0 || data == nullptr || length <= 0) {
         LOGE("nativeDecodeFrame: invalid args");
         return static_cast<jint>(DecodeError::INVALID_DATA);
     }
-
     jboolean isCopy = JNI_FALSE;
-    jbyte* bytes = env->GetByteArrayElements(data, &isCopy);
+    jbyte *bytes = env->GetByteArrayElements(data, &isCopy);
     if (bytes == nullptr) {
         LOGE("nativeDecodeFrame: GetByteArrayElements failed");
         return static_cast<jint>(DecodeError::INVALID_DATA);
     }
-
     DecodeError err = toDecoder(handle)->decodeFrame(
             reinterpret_cast<const uint8_t*>(bytes),
             static_cast<size_t>(length));
-
     env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
     return static_cast<jint>(err);
 }
 
-// Flush 重置
-JNIEXPORT void JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeFlush(JNIEnv* /*env*/, jobject /*thiz*/,
-                                                          jlong handle) {
+static void nativeFlush(JNIEnv * /*env*/, jobject /*thiz*/, jlong handle) {
     if (handle == 0) {
         LOGE("nativeFlush: invalid handle");
         return;
@@ -89,17 +71,48 @@ Java_com_mediakit_h264decoder_H264JniDecoder_nativeFlush(JNIEnv* /*env*/, jobjec
     toDecoder(handle)->flush();
 }
 
-// 释放所有资源
-JNIEXPORT void JNICALL
-Java_com_mediakit_h264decoder_H264JniDecoder_nativeRelease(JNIEnv* /*env*/, jobject /*thiz*/,
-                                                            jlong handle) {
+static void nativeRelease(JNIEnv * /*env*/, jobject /*thiz*/, jlong handle) {
     if (handle == 0) {
         LOGE("nativeRelease: invalid handle");
         return;
     }
-    H264FrameDecoder* decoder = toDecoder(handle);
+    H264FrameDecoder *decoder = toDecoder(handle);
     decoder->release();
     delete decoder;
 }
 
-} // extern "C"
+// ── 动态注册表 ────────────────────────────────────────────────────────────────
+
+static const JNINativeMethod kMethods[] = {
+        {"nativeCreate",      "()J",                        reinterpret_cast<void *>(nativeCreate)},
+        {"nativeSetSurface",  "(JLandroid/view/Surface;)V", reinterpret_cast<void *>(nativeSetSurface)},
+        {"nativeInit",        "(JII)I",                     reinterpret_cast<void *>(nativeInit)},
+        {"nativeDecodeFrame", "(J[BI)I",                    reinterpret_cast<void *>(nativeDecodeFrame)},
+        {"nativeFlush",       "(J)V",                       reinterpret_cast<void *>(nativeFlush)},
+        {"nativeRelease",     "(J)V",                       reinterpret_cast<void *>(nativeRelease)},
+};
+
+// ── JNI_OnLoad：库加载时自动调用，完成动态注册 ───────────────────────────────
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        LOGE("JNI_OnLoad: GetEnv failed");
+        return JNI_ERR;
+    }
+
+    jclass clazz = env->FindClass("com/mediakit/h264decoder/H264JniDecoder");
+    if (clazz == nullptr) {
+        LOGE("JNI_OnLoad: FindClass failed");
+        return JNI_ERR;
+    }
+
+    if (env->RegisterNatives(clazz, kMethods,
+                             static_cast<jint>(sizeof(kMethods) / sizeof(kMethods[0]))) != 0) {
+        LOGE("JNI_OnLoad: RegisterNatives failed");
+        return JNI_ERR;
+    }
+
+    LOGE("JNI_OnLoad: registered %zu methods", sizeof(kMethods) / sizeof(kMethods[0]));
+    return JNI_VERSION_1_6;
+}

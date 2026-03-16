@@ -5,7 +5,7 @@
 #include <android/native_window.h>
 #include <cstdint>
 #include <vector>
-#include <queue>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -66,7 +66,6 @@ private:
     void inputThreadFunc();   // 从 frameQueue_ 取帧 → codec 输入
     void outputThreadFunc();  // codec 输出 → 渲染到 Surface
 
-    // ── NALU 工具 ─────────────────────────────────────────────────
     static const uint8_t* findNaluStart(const uint8_t* data, size_t len, int* startCodeLen);
     static NaluType parseNaluType(const uint8_t* naluData);
 
@@ -74,30 +73,30 @@ private:
     void enqueueFirstFrame(const uint8_t* idrData, size_t idrLen);
 
 private:
-    AMediaCodec*   codec_  = nullptr;
-    ANativeWindow* window_ = nullptr;
-    AMediaFormat*  format_ = nullptr;
+    AMediaCodec *codec_ = nullptr;
+    ANativeWindow *window_ = nullptr;
+    AMediaFormat *format_ = nullptr;
 
     // SPS/PPS 缓存（含起始码）
     std::vector<uint8_t> spsBuffer_;
     std::vector<uint8_t> ppsBuffer_;
     bool firstFrameSent_ = false;
 
-    // ── 帧队列（Java → input线程）────────────────────────────────
-    static constexpr size_t MAX_QUEUE_SIZE = 60;
-    std::queue<std::vector<uint8_t>> frameQueue_;
-    std::mutex               queueMutex_;
-    std::condition_variable  queueCv_;
+    // deque 支持 push_front，超时帧可回队头保持顺序
+    static constexpr size_t MAX_QUEUE_SIZE = 8;
+    std::deque<std::vector<uint8_t>> frameQueue_;
+    std::mutex queueMutex_;
+    std::condition_variable queueCv_;
 
     // ── 工作线程 ──────────────────────────────────────────────────
-    std::thread      inputThread_;
-    std::thread      outputThread_;
+    std::thread inputThread_;
+    std::thread outputThread_;
     std::atomic_bool running_{false};
 
     // ── PTS ───────────────────────────────────────────────────────
     std::atomic<int64_t> ptsUs_{0};
 
-    static constexpr int64_t INPUT_TIMEOUT_US  = 10'000;   // 10ms
+    static constexpr int64_t INPUT_TIMEOUT_US = 10'000;   // 10ms
     static constexpr int64_t OUTPUT_TIMEOUT_US = 10'000;   // 10ms
     static constexpr int64_t PTS_STEP_US       = 33'333;   // ~30fps
 };

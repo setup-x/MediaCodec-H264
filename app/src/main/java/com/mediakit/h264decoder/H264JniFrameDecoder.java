@@ -22,10 +22,11 @@ public class H264JniFrameDecoder {
 
     private static final String TAG = "H264JniFrameDecoder";
 
-    private static final int    DEFAULT_WIDTH     = 1920;
-    private static final int    DEFAULT_HEIGHT    = 1080;
-    private static final long   FRAME_INTERVAL_MS = 33;
-    private static final int    READ_BUFFER_SIZE  = 64 * 1024;
+    private static final int DEFAULT_WIDTH = 1920;
+    private static final int DEFAULT_HEIGHT = 1080;
+    private static final int READ_BUFFER_SIZE = 64 * 1024;
+    // 目标帧间隔（可由外部设置，默认 30fps）
+    private volatile long frameIntervalMs = 33;
 
     private final Context context;
     private final Surface surface;
@@ -40,7 +41,16 @@ public class H264JniFrameDecoder {
         this.surface = surface;
     }
 
-    /** 开始从 assets 中循环解码指定 H264 裸流文件。 */
+    /**
+     * 设置目标帧率，默认 30fps。实时流场景可设为 0 禁用节流。
+     */
+    public void setTargetFps(int fps) {
+        frameIntervalMs = fps > 0 ? (1000L / fps) : 0;
+    }
+
+    /**
+     * 开始从 assets 中循环解码指定 H264 裸流文件。
+     */
     public void startDecoding(final String assetPath) {
         if (running) return;
         running = true;
@@ -124,35 +134,55 @@ public class H264JniFrameDecoder {
     }
 
     /**
-     * 分发单帧：等到 SPS 关键帧后才开始解码，并按帧率限速。
+     * 分发单帧：等到 SPS 关键帧后才开始解码，按实际耗时自适应节流。
      * @return 更新后的 keyFrameSeen 状态
      */
     private boolean dispatchFrame(byte[] frame, boolean keyFrameSeen) {
         if (!keyFrameSeen) {
             if (!H264AsynMediaCodec.isAvcKeyFrame(frame)) {
-                Log.d(TAG, "skip non-SPS frame before keyframe");
                 return false;
             }
             keyFrameSeen = true;
         }
 
         if (jniDecoder != null) {
+            long t0 = System.currentTimeMillis();
             int ret = jniDecoder.decodeFrame(frame, frame.length);
             if (ret != H264JniDecoder.OK) {
                 Log.w(TAG, "decodeFrame ret=" + ret);
             }
-        }
-
-        try {
-            Thread.sleep(FRAME_INTERVAL_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            // 自适应节流：用剩余时间 sleep，而非固定 sleep
+            long interval = frameIntervalMs;
+            if (interval > 0) {
+                long elapsed = System.currentTimeMillis() - t0;
+                long remaining = interval - elapsed;
+                if (remaining > 0) {
+                    try {
+                        Thread.sleep(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
         }
 
         return keyFrameSeen;
     }
 
     // ─── 工具方法 ─────────────────────────────────────────────────────────────
+
+    /**
+     * 在 data[start..length) 中查找下一个起始码位置，未找到返回 -1
+     */
+    private static int findStartCode(byte[] data, int start, int length) {
+        for (int i = start; i < length - 3; i++) {
+            if (data[i] == 0x00 && data[i + 1] == 0x00) {
+                if (data[i + 2] == 0x01) return i;
+                if (i + 3 < length && data[i + 2] == 0x00 && data[i + 3] == 0x01) return i;
+            }
+        }
+        return -1;
+    }
 
     private static byte[] concat(byte[] a, byte[] b, int bLen) {
         byte[] result = new byte[a.length + bLen];
@@ -165,15 +195,5 @@ public class H264JniFrameDecoder {
         byte[] result = new byte[to - from];
         System.arraycopy(src, from, result, 0, result.length);
         return result;
-    }
-
-    private static int findStartCode(byte[] data, int start, int length) {
-        for (int i = start; i < length - 3; i++) {
-            if (data[i] == 0x00 && data[i + 1] == 0x00) {
-                if (data[i + 2] == 0x01) return i;
-                if (data[i + 2] == 0x00 && data[i + 3] == 0x01) return i;
-            }
-        }
-        return -1;
     }
 }

@@ -36,21 +36,25 @@ DecodeError H264FrameDecoder::init(int width, int height) {
         LOGE("init: no surface bound");
         return DecodeError::NO_SURFACE;
     }
-    if (width  <= 0) width  = 1920;
+    if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
 
     format_ = AMediaFormat_new();
     AMediaFormat_setString(format_, AMEDIAFORMAT_KEY_MIME, "video/avc");
-    AMediaFormat_setInt32(format_,  AMEDIAFORMAT_KEY_WIDTH,  width);
-    AMediaFormat_setInt32(format_,  AMEDIAFORMAT_KEY_HEIGHT, height);
+    AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_WIDTH, width);
+    AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_HEIGHT, height);
+    // 提示硬件解码器启用低延时模式（不支持的芯片会忽略此参数）
+    AMediaFormat_setInt32(format_, AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
 
     codec_ = AMediaCodec_createDecoderByType("video/avc");
     if (codec_ == nullptr) {
         LOGE("init: createDecoderByType failed");
-        AMediaFormat_delete(format_); format_ = nullptr;
+        AMediaFormat_delete(format_);
+        format_ = nullptr;
         return DecodeError::CODEC_CREATE_FAILED;
     }
 
+    // 同步模式：configure → start，inputThread 用 dequeueInputBuffer，outputThread 用 dequeueOutputBuffer
     media_status_t st = AMediaCodec_configure(codec_, format_, window_, nullptr, 0);
     if (st != AMEDIA_OK) {
         LOGE("init: configure failed, st=%d", st);
@@ -76,11 +80,9 @@ DecodeError H264FrameDecoder::init(int width, int height) {
 }
 
 void H264FrameDecoder::release() {
-    if (!running_.exchange(false)) return;  // 已经释放过
+    if (!running_.exchange(false)) return;
 
-    // 唤醒 input 线程退出
     queueCv_.notify_all();
-
     if (inputThread_.joinable())  inputThread_.join();
     if (outputThread_.joinable()) outputThread_.join();
 
@@ -100,7 +102,7 @@ void H264FrameDecoder::release() {
 
     {
         std::lock_guard<std::mutex> lk(queueMutex_);
-        while (!frameQueue_.empty()) frameQueue_.pop();
+        frameQueue_.clear();
     }
     spsBuffer_.clear();
     ppsBuffer_.clear();
@@ -112,7 +114,7 @@ void H264FrameDecoder::release() {
 void H264FrameDecoder::flush() {
     {
         std::lock_guard<std::mutex> lk(queueMutex_);
-        while (!frameQueue_.empty()) frameQueue_.pop();
+        frameQueue_.clear();
     }
     if (codec_ != nullptr) {
         AMediaCodec_flush(codec_);
@@ -124,7 +126,7 @@ void H264FrameDecoder::flush() {
     LOGI("flush: done");
 }
 
-// ── decodeFrame（Java 层调用，非阻塞）────────────────────────────────────────
+// ── decodeFrame（非阻塞投递）─────────────────────────────────────────────────
 
 DecodeError H264FrameDecoder::decodeFrame(const uint8_t* data, size_t length) {
     if (codec_ == nullptr || !running_) return DecodeError::NOT_INITIALIZED;
@@ -156,16 +158,16 @@ DecodeError H264FrameDecoder::decodeFrame(const uint8_t* data, size_t length) {
         return DecodeError::OK;
     }
 
-    // 普通帧：直接入队
-    if (!firstFrameSent_) return DecodeError::OK;  // 还没收到首帧，丢弃
+    if (!firstFrameSent_) return DecodeError::OK;
 
     {
         std::lock_guard<std::mutex> lk(queueMutex_);
         if (frameQueue_.size() >= MAX_QUEUE_SIZE) {
-            LOGE("decodeFrame: queue full, drop frame");
-            return DecodeError::OK;
+            // 丢最旧帧，保持低延时
+            frameQueue_.pop_front();
+            LOGE("decodeFrame: queue full, drop oldest frame");
         }
-        frameQueue_.emplace(data, data + length);
+        frameQueue_.emplace_back(data, data + length);
     }
     queueCv_.notify_one();
     return DecodeError::OK;
@@ -179,7 +181,7 @@ void H264FrameDecoder::enqueueFirstFrame(const uint8_t* idrData, size_t idrLen) 
     combined.insert(combined.end(), idrData, idrData + idrLen);
 
     std::lock_guard<std::mutex> lk(queueMutex_);
-    frameQueue_.push(std::move(combined));
+    frameQueue_.push_back(std::move(combined));
     queueCv_.notify_one();
 }
 
@@ -196,15 +198,14 @@ void H264FrameDecoder::inputThreadFunc() {
             });
             if (!running_ && frameQueue_.empty()) break;
             frame = std::move(frameQueue_.front());
-            frameQueue_.pop();
+            frameQueue_.pop_front();
         }
 
-        // 尝试获取输入 buffer，短超时避免长时间阻塞
         ssize_t bufIdx = AMediaCodec_dequeueInputBuffer(codec_, INPUT_TIMEOUT_US);
         if (bufIdx < 0) {
-            // 超时则把帧塞回队头（重新入队头部用 deque 更好，这里简单重入队尾）
+            // 超时：帧回队头，保持顺序
             std::lock_guard<std::mutex> lk(queueMutex_);
-            frameQueue_.push(std::move(frame));
+            frameQueue_.push_front(std::move(frame));
             continue;
         }
 
@@ -224,7 +225,7 @@ void H264FrameDecoder::inputThreadFunc() {
     LOGI("inputThread: exited");
 }
 
-// ── output 线程：codec 输出 buffer → 渲染 ────────────────────────────────────
+// ── output 线程：codec 输出 → 渲染到 Surface ─────────────────────────────────
 
 void H264FrameDecoder::outputThreadFunc() {
     LOGI("outputThread: started");
@@ -233,7 +234,7 @@ void H264FrameDecoder::outputThreadFunc() {
         ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec_, &info, OUTPUT_TIMEOUT_US);
 
         if (outIdx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
-            continue;  // 超时，继续轮询
+            continue;
         }
         if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             AMediaFormat* fmt = AMediaCodec_getOutputFormat(codec_);
